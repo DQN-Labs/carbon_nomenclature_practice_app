@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Hemanth's Carbon Nomenclature Quiz</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{
+    --bg:#f4f4f4; --card:#ffffff; --text:#111;
+  }
+  body { margin:0; font-family:Inter, Arial, Helvetica, monospace; background:var(--bg); color:var(--text); }
+  .topbar{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;}
+  .branding{font-weight:700;font-size:18px}
+  .controls label{margin-left:10px;font-size:14px}
+  .container{display:flex;flex-direction:column;align-items:center;gap:12px;padding:0 12px 40px;}
+  .card{background:var(--card);padding:16px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.06);width:100%;max-width:900px;}
+  canvas{display:block;margin:0 auto;background:transparent}
+  .row{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap}
+  input[type="text"]{padding:10px 12px;font-size:16px;border-radius:8px;border:1px solid #ccc;width:320px}
+  button{padding:10px 14px;border-radius:8px;border:none;background:#1677ff;color:white;font-weight:600;cursor:pointer}
+  .status{font-weight:700;margin-top:6px;font-size:16px}
+  .scoreboard{font-size:14px;color:#333;margin-left:8px}
+  .darkbody { --bg:#121216; --card:#1b1b1f; --text:#e6e6e6; }
+  .footer{font-size:13px;color: #555; text-align:center;margin-top:8px}
+  @media (max-width:520px){ input[type="text"]{width:95%} canvas{width:100%} }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="branding">🔬 Hemanth's nomenclature tool</div>
+    <div class="controls">
+      <label><input id="darkToggle" type="checkbox"> Dark Mode</label>
+      
+      <span class="scoreboard" id="scoreboard">Correct: 0 • Tried: 0</span>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="card" style="max-width:400px;">
+  <h4>Leaderboard</h4>
+  <ol id="leaderboardList"></ol>
+</div>
+
+<div class="footer">
+  <span id="playerName">Player: ???</span>
+</div>
+    <div class="card">
+      <h3 style="margin:0 0 8px 0;text-align:center">Identify the compound</h3>
+      <canvas id="molCanvas" width="820" height="240"></canvas>
+
+      <div class="row" style="margin-top:12px">
+        <input id="answer" type="text" placeholder="Enter IUPAC name (e.g. ethanol or propan-2-ol)" />
+        <button id="submitBtn">Submit</button>
+        <button id="nextBtn">Skip / Next</button>
+      </div>
+      <div class="status" id="result"></div>
+    </div>
+
+    <div class="footer">Tips: Press Enter to submit. I accept common typing variants (hyphens/spaces). If you're wrong you'll see the correct IUPAC name.</div>
+    <div class="footer">Many of the diagrams provided are inaccurate, and will be missing a few hydrogen atoms or something. Deal with it.</div>
+  </div>
+
+<script>
+/*
+  Full rewrite:
+  - Random molecule generator (chain length, functional group, substituents)
+  - Canvas renderer draws explicit C and H and functional groups (text-based nodes + bond lines)
+  - Normalized tolerant answer checking (removes hyphens/spaces/locants; accepts some synonyms)
+  - Dark mode + auto-scroll + Enter submit + scoreboard
+*/
+
+// Helpers
+const randInt = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
+const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+const roots = {1:'meth',2:'eth',3:'prop',4:'but',5:'pent',6:'hex'};
+
+// Allowed groups and min chain length
+const groups = [
+  {id:'alkane', min:1},
+  {id:'alkene', min:2},
+  {id:'alkyne', min:2},
+  {id:'alcohol', min:1},
+  {id:'aldehyde', min:1},
+  {id:'acid', min:1},
+  {id:'ketone', min:3},
+  {id:'amine', min:1},
+  {id:'halo', min:1}
+];
+
+// synonyms mapping normalized -> canonical normalized
+const synonyms = {
+  'aceticacid':'ethanoicacid',
+  'acetone':'propanone',
+  'isopropylalcohol':'propan2ol',
+  'isopropanol':'propan2ol',
+  'formicacid':'methanoicacid',
+  'formaldehyde':'methanal',
+  'methylamine':'methylamine'
+};
+
+let playerName = localStorage.getItem('playerName') || '';
+if(!playerName){
+  playerName = prompt("Enter your name for the leaderboard") || "Player";
+  localStorage.setItem('playerName', playerName);
+}
+document.getElementById('playerName').textContent = `Player: ${playerName}`;
+
+let leaderboard = JSON.parse(localStorage.getItem('leaderboard')) || [];
+
+async function submitScore() {
+  const name = document.getElementById('playerName').value || 'Anon';
+  await fetch('https://your-render-serverless.com/updateScores', {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({ name, score: correct })
+  });
+}
+
+async function fetchLeaderboard() {
+  const res = await fetch('https://your-render-serverless.com/updateScores');
+  const leaderboard = await res.json();
+  document.getElementById('leaderboard').innerHTML =
+    leaderboard.map((p,i)=>`${i+1}. ${p.name}: ${p.score}`).join('<br>');
+}
+
+// Call this after each answer submission
+
+// normalize answers: lowercase, replace known synonyms, remove non-letter characters
+function normalize(s){
+  if(!s) return '';
+  s = s.toLowerCase().trim();
+  // replace common words
+  s = s.replace(/\s+/g,''); // remove spaces
+  s = s.replace(/–|—|−/g,'-'); // weird dashes -> hyphen
+  s = s.replace(/\(|\)|,|\./g,''); // remove punctuation
+  // map some human variants: e.g. 'ethanoicacid' vs 'aceticacid'
+  const lettersOnly = s.replace(/[^a-z0-9]/g,'');
+  if(synonyms[lettersOnly]) return synonyms[lettersOnly];
+  // remove numbers and hyphens for tolerant compare (accept "propan-2-ol" vs "propanol")
+  return lettersOnly.replace(/[0-9\-]/g,'');
+}
+
+function chooseLowestLocant(loc, chainLength) {
+  const fromLeft = loc + 1;               // numbering left to right
+  const fromRight = chainLength - loc;    // numbering right to left
+  return (fromLeft <= fromRight) ? loc : (chainLength - 1 - loc);
+}
+
+function getBestDirection(chain, substituents, mainType, params) {
+  let forwardLocants = getLocants(chain, substituents, mainType, params, false);
+  let backwardLocants = getLocants([...chain].reverse(), substituents, mainType, params, true);
+
+  // compare lexicographically
+  for (let i = 0; i < Math.max(forwardLocants.length, backwardLocants.length); i++) {
+    if ((forwardLocants[i] ?? Infinity) < (backwardLocants[i] ?? Infinity)) {
+      return {direction: "forward", locants: forwardLocants};
+    }
+    if ((backwardLocants[i] ?? Infinity) < (forwardLocants[i] ?? Infinity)) {
+      return {direction: "backward", locants: backwardLocants};
+    }
+  }
+  return {direction: "forward", locants: forwardLocants}; // default
+}
+
+function getLocants(chain, substituents, mainType, params, reversed) {
+  let locants = [];
+
+  if (mainType === 'alkene' || mainType === 'alkyne') {
+    locants.push(reversed ? (chain.length - params.dbLoc) : (params.dbLoc+1));
+  }
+
+  if (mainType === 'alcohol') {
+    locants.push(reversed ? (chain.length - params.ohLoc) : (params.ohLoc+1));
+  }
+
+  for (let sub of substituents) {
+    locants.push(reversed ? (chain.length - sub.position) : (sub.position+1));
+  }
+
+  return locants.sort((a,b) => a-b);
+}
+// Build IUPAC name from generation parameters (best-effort for CBSE-level)
+function buildName(params){
+  const L = params.length;
+  const root = roots[L];
+  const subs = params.substituents || []; // array of {loc,type}
+  const subParts = subs.map(s => `${s.loc+1}-${s.type}`).sort();
+  let main = '';
+  switch(params.group){
+    case 'alkane':
+      main = root+'ane';
+      break;
+    case 'alkene':
+      // locant is (pos+1)
+      main = `${root}-${params.dbLoc+1}-${'ene'}`;
+      break;
+    case 'alkyne':
+      main = `${root}-${params.dbLoc+1}-${'yne'}`;
+      break;
+    case 'alcohol':
+      // choose correct locant; for small chains common names used without number (ethanol)
+      if(L<=2) main = root+'anol'; // ethanol/methanol
+      else main = `${root}-${params.groupLoc+1}-ol`.replace('--','-');
+      main = main.replace('anol','anol').replace('methanol','methanol');
+      break;
+    case 'aldehyde':
+      main = root + 'al';
+      break;
+    case 'acid':
+      main = root + 'oicacid';
+      break;
+    case 'ketone':
+      main = `${root}-${params.groupLoc+1}-one`;
+      break;
+    case 'amine':
+      main = root + 'amine';
+      break;
+    case 'halo':
+      // halo as substituent (chloro)
+      if(params.substituents && params.substituents.length){
+        // handled in subs part
+        main = root+'ane';
+      } else {
+        main = 'chloro' + root + 'ane';
+      }
+      break;
+    default:
+      main = root+'ane';
+  }
+
+  let name = '';
+  if(subParts.length){
+    name = subParts.join(',') + '-' + main;
+  } else {
+    name = main;
+  }
+
+  // tidy: replace double hyphens
+  name = name.replace(/--/g,'-');
+  // small replacements to make the name look nicer
+  name = name.replace('oicacid','oic acid'); // show with space to look like CBSE textbook
+  name = name.replace('anol','anol'); // nothing to do
+  name = name.replace(/(\d+)-/,'$1-'); // just keep as is
+  return name;
+}
+
+// Generate molecule parameters
+function generateMolecule(){
+  // chain length 1..5 (1->meth to 5->pent)
+  const L = randInt(1,5);
+  // pick possible groups respecting min length
+  const allowed = groups.filter(g => g.min <= L);
+  let group = pick(allowed).id;
+
+  // to avoid odd combos, small bias: if L==1, prefer simple groups
+  if(L==1 && Math.random() < 0.4) group = pick(['alkane','alcohol','aldehyde','acid','amine','halo']);
+
+  // parameters object
+  const params = { length: L, group: group, substituents: [], dbLoc: null, groupLoc: null };
+
+  // optional methyl substituent (branching) for chains length >=3
+  if(L>=3 && Math.random() < 0.35){
+    // choose a middle carbon (1..L-2) to make a proper branch like 2-methylpropane
+    const pos = randInt(1, L-2);
+    params.substituents.push({loc: pos, type:'methyl'});
+  } else {
+    // with small chance add a chloro substituent for halo group
+    if(group !== 'halo' && Math.random() < 0.12 && L>=2){
+      const pos = randInt(0, L-1);
+      params.substituents.push({loc: pos, type:'chloro'});
+    }
+  }
+
+  // group-specific settings
+  if(group === 'alkene'){
+    params.dbLoc = randInt(0, Math.max(0,L-2)); // between C1 and CL-1 (index)
+  } else if(group === 'alkyne'){
+    params.dbLoc = randInt(0, Math.max(0,L-2));
+  } else if(group === 'alcohol'){
+    params.groupLoc = randInt(0, L-1);
+  } else if(group === 'antifiller'){ /* none */ }
+  else if(group === 'ketone'){
+    params.groupLoc = randInt(1, L-2); // internal carbon
+  } else if(group === 'amine'){
+    params.groupLoc = randInt(0, L-1);
+  } else if(group === 'halo'){
+    // treat as substituent chloro at a position
+    const pos = randInt(0,L-1);
+    params.substituents.push({loc:pos,type:'chloro'});
+    // convert to alkane main chain for naming
+    params.group = 'halo';
+  } else if(group === 'aldehyde' || group === 'acid'){
+    // we will attach to terminal (rightmost)
+    params.groupLoc = L-1;
+  }
+
+  // Build IUPAC name (best-effort)
+  params.name = buildName(params);
+
+  // Build a renderable structure describing bonds + extras
+  // We'll treat main chain carbons at indices 0..L-1
+  // and decorations (functional groups / substituents) attached accordingly.
+
+  return params;
+}
+
+// Canvas drawing: draws explicit C and H text and bond lines
+function drawMoleculeOnCanvas(params){
+  const canvas = document.getElementById('molCanvas');
+  const ctx = canvas.getContext('2d');
+  // responsive: scale canvas css size but use fixed logical pixels
+  canvas.width = Math.min(820, Math.max(480, window.innerWidth - 40));
+  canvas.height = 240;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--molbox') || '#fff';
+ctx.fillRect(0,0,canvas.width,canvas.height);
+
+
+  // styles
+  const W = canvas.width;
+  const H = canvas.height;
+  const marginLeft = 70;
+  const gap = Math.min(100, Math.floor((W - 140) / Math.max(1, params.length))); // spacing carbon nodes
+  const y = H/2;
+  ctx.lineWidth = 2;
+
+  // compute positions
+  const positions = [];
+  for(let i=0;i<params.length;i++){
+    const x = marginLeft + i*gap;
+    positions.push({x,y});
+  }
+
+  // For each carbon compute bond orders to neighbours
+  // by default single bonds between neighboring carbons
+  const bondOrders = new Array(Math.max(1,params.length-1)).fill(1);
+  if(params.group === 'alkene' && params.dbLoc !== null){
+    bondOrders[params.dbLoc] = 2;
+  }
+  if(params.group === 'alkyne' && params.dbLoc !== null){
+    bondOrders[params.dbLoc] = 3;
+  }
+
+  // helper to draw a single/double/triple bond between two points
+  function drawBond(x1,y1,x2,y2,order=1){
+    ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--text') || '#111';
+    ctx.lineWidth = 2;
+    if(order === 1){
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    } else if(order === 2){
+      // draw two parallel lines offset perpendicular to the bond
+      const dx = x2 - x1, dy = y2 - y1;
+      const len = Math.hypot(dx,dy);
+      const ux = dx / len, uy = dy / len;
+      const ox = -uy * 6, oy = ux * 6;
+      ctx.beginPath(); ctx.moveTo(x1+ox,y1+oy); ctx.lineTo(x2+ox,y2+oy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1-ox,y1-oy); ctx.lineTo(x2-ox,y2-oy); ctx.stroke();
+    } else if(order === 3){
+      // three parallel lines (center + two offsets)
+      const dx = x2 - x1, dy = y2 - y1;
+      const len = Math.hypot(dx,dy);
+      const ux = dx / len, uy = dy / len;
+      const ox = -uy * 7, oy = ux * 7;
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1+ox,y1+oy); ctx.lineTo(x2+ox,y2+oy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1-ox,y1-oy); ctx.lineTo(x2-ox,y2-oy); ctx.stroke();
+    }
+  }
+
+  // Determine attachments (substituents and functional groups)
+  const attachments = {}; // key = carbon index, value = array of {type: 'methyl'|'OH'|'=O'|'CH3'|'Cl'|'NH2' etc}
+  for(const s of (params.substituents||[])){
+    attachments[s.loc] = attachments[s.loc] || [];
+    if(s.type === 'methyl') attachments[s.loc].push({type:'methyl'});
+    else if(s.type === 'chloro') attachments[s.loc].push({type:'Cl'});
+  }
+  // functional groups
+  if(params.group === 'alcohol'){
+    attachments[params.groupLoc] = attachments[params.groupLoc] || [];
+    attachments[params.groupLoc].push({type:'OH'});
+  } else if(params.group === 'amine'){
+    attachments[params.groupLoc] = attachments[params.groupLoc] || [];
+    attachments[params.groupLoc].push({type:'NH2'});
+  } else if(params.group === 'aldehyde'){
+    // terminal carbon rightmost gets =O and H
+    attachments[params.groupLoc] = attachments[params.groupLoc] || [];
+    attachments[params.groupLoc].push({type:'=O'});
+    attachments[params.groupLoc].push({type:'H_attached'}); // special H attached to carbon
+  } else if(params.group === 'acid'){
+    // COOH at terminal
+    // We'll represent as =O and -OH attached to terminal carbon (i.e., two attachments)
+    attachments[params.groupLoc] = attachments[params.groupLoc] || [];
+    attachments[params.groupLoc].push({type:'=O'});
+    attachments[params.groupLoc].push({type:'OH_carboxyl'});
+  } else if(params.group === 'ketone'){
+    attachments[params.groupLoc] = attachments[params.groupLoc] || [];
+    attachments[params.groupLoc].push({type:'=O'});
+  }
+
+  // Now compute bond order sums for valence
+  const bondSum = new Array(params.length).fill(0);
+  for(let i=0;i<params.length;i++){
+    // bonds to neighbors
+    if(i>0) bondSum[i] += bondOrders[i-1];
+    if(i<params.length-1) bondSum[i] += bondOrders[i];
+    // attachments
+    const at = attachments[i]||[];
+    for(const a of at){
+      if(a.type === 'methyl' || a.type === 'Cl' || a.type === 'NH2' || a.type === 'OH') bondSum[i] += 1;
+      else if(a.type === '=O') bondSum[i] += 2;
+      else if(a.type === 'OH_carboxyl') bondSum[i] += 1;
+      else if(a.type === 'H_attached') bondSum[i] += 1;
+    }
+  }
+
+  // Draw main chain bonds first (so attachments overlay nicely)
+  for(let i=0;i<params.length-1;i++){
+    const a = positions[i], b = positions[i+1];
+    drawBond(a.x, a.y, b.x, b.y, bondOrders[i]);
+  }
+
+  // For each carbon draw attachments (lines to substituents/functional groups) and hydrogens
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 16px monospace';
+  const atomColor = '#111'; // always black for diagram
+  const diagramColor = '#111'; // black for all atoms & bonds
+
+
+
+  for(let i=0;i<params.length;i++){
+    const pos = positions[i];
+    // draw substituent lines and labels (choose orientation top or bottom for substitutions)
+    const at = attachments[i] || [];
+    // reserved slots: if there is neighbor on left, that direction is occupied; if neighbor on right occupied
+    const leftOccupied = (i>0);
+    const rightOccupied = (i<params.length-1);
+    // available sides preference: top, bottom, left (if free), right (if free)
+    const sideSlots = [];
+    if(!leftOccupied) sideSlots.push('left'); // for terminal leftmost carbon
+    sideSlots.push('top');
+    sideSlots.push('bottom');
+    if(!rightOccupied) sideSlots.push('right'); // for terminal rightmost carbon
+
+    let usedSlots = {}; // to avoid overlaps
+    // draw attachments
+    for(const a of at){
+      // choose first free slot
+      let slot = sideSlots.find(s => !(s in usedSlots));
+      if(!slot) slot = 'top';
+      usedSlots[slot] = true;
+      let ax, ay, tx, ty;
+      const offset = 40;
+      if(slot === 'top'){
+        ax = pos.x; ay = pos.y - 20;
+        tx = pos.x; ty = pos.y - offset;
+      } else if(slot === 'bottom'){
+        ax = pos.x; ay = pos.y + 20;
+        tx = pos.x; ty = pos.y + offset;
+      } else if(slot === 'left'){
+        ax = pos.x - 20; ay = pos.y;
+        tx = pos.x - offset; ty = pos.y;
+      } else { // right
+        ax = pos.x + 20; ay = pos.y;
+        tx = pos.x + offset; ty = pos.y;
+      }
+
+      // draw line
+      ctx.strokeStyle = atomColor;
+      ctx.beginPath(); ctx.moveTo(pos.x, pos.y); ctx.lineTo(ax, ay); ctx.lineTo(tx, ty); ctx.stroke();
+
+      // draw label (type)
+      ctx.fillStyle = atomColor;
+      ctx.font = 'bold 14px monospace';
+      if(a.type === 'methyl'){
+        ctx.fillText('CH3', tx, ty);
+      } else if(a.type === 'Cl'){
+        ctx.fillText('Cl', tx, ty);
+      } else if(a.type === 'OH'){
+        ctx.fillText('OH', tx, ty);
+      } else if(a.type === 'NH2'){
+        ctx.fillText('NH2', tx, ty);
+      } else if(a.type === '=O'){
+        // draw O slightly above and draw double bond to it
+        const ox = tx, oy = ty;
+        // draw double bond between pos and (ox,oy)
+        drawBond(pos.x, pos.y, ox, oy, 2);
+        ctx.fillText('O', ox, oy);
+      } else if(a.type === 'OH_carboxyl'){
+        // typically draw O-H to the right region; we already drew =O earlier; this will be OH
+        ctx.fillText('OH', tx, ty);
+      } else if(a.type === 'H_attached'){
+        ctx.fillText('H', tx, ty);
+      }
+    }
+
+    // Now compute H count and draw hydrogens in remaining free slots
+    const totalBonds = bondSum[i];
+    const Hcount = Math.max(0, 4 - totalBonds);
+
+    // decide hydrogens slot order
+    const hydSlots = [];
+    // Recompute free slots (prefer top, bottom, left, right)
+    const preferred = [];
+    if(!leftOccupied) preferred.push('left');
+    preferred.push('top'); preferred.push('bottom');
+    if(!rightOccupied) preferred.push('right');
+    for(const s of preferred) if(!(s in usedSlots)) hydSlots.push(s);
+
+    // If more hydrogens than available, put multiple on same slot (like CH3 show as CH3)
+    // We'll convert multiple hydrogens to 'H', 'H' and if needed use 'H2' style for extra but better show 'H' labels near space
+    if(Hcount === 3 && !leftOccupied && !rightOccupied){
+      // terminal CH3 -> show one CH3 to left or right depending availability
+      // but easier: denote CH3 as label on outer side
+      const side = (!leftOccupied)?'left':'right';
+      const tx = (side==='left')? pos.x - 60 : pos.x + 60;
+      const ty = pos.y;
+      ctx.fillStyle = atomColor;
+      ctx.font = 'bold 14px monospace';
+      ctx.fillText('H', pos.x - (side==='left'?40:-40), pos.y); // a single H nearer
+      ctx.fillText('CH3', tx, ty); // CH3 as grouped label
+    } else {
+      // draw Hcount hydrogens individually in slots
+      let drawn = 0;
+      for(let hs=0; hs<Hcount && hs<hydSlots.length; hs++){
+        const s = hydSlots[hs];
+        let tx = pos.x, ty = pos.y;
+        if(s==='top'){ tx = pos.x; ty = pos.y - 54; }
+        else if(s==='bottom'){ tx = pos.x; ty = pos.y + 54; }
+        else if(s==='left'){ tx = pos.x - 54; ty = pos.y; }
+        else { tx = pos.x + 54; ty = pos.y; }
+        // draw connecting line
+        ctx.beginPath(); ctx.moveTo(pos.x, pos.y); ctx.lineTo((pos.x+tx)/2, (pos.y+ty)/2 - 2); ctx.stroke();
+        ctx.fillStyle = atomColor;
+        ctx.font = 'bold 14px monospace';
+        ctx.fillText('H', tx, ty);
+        drawn++;
+      }
+      // if still hydrogens left (rare), cluster them near top-right
+      if(Hcount > drawn){
+        ctx.fillStyle = atomColor;
+        ctx.font = 'bold 14px monospace';
+        ctx.fillText('H', pos.x+30, pos.y-36);
+        if(Hcount > drawn+1) ctx.fillText('H', pos.x+30, pos.y+36);
+      }
+    }
+
+    // Finally draw the Carbon circle/letter
+    
+    ctx.beginPath();
+// Keep Carbon circle white always
+ctx.fillStyle = '#fff'; 
+ctx.strokeStyle = atomColor; // bonds/outline still dynamic
+ctx.lineWidth = 1.5;
+ctx.arc(pos.x, pos.y, 16, 0, Math.PI*2);
+ctx.fill();
+ctx.stroke();
+
+// draw the C letter in black always for readability
+ctx.fillStyle = '#000';
+ctx.font = 'bold 16px monospace';
+ctx.fillText('C', pos.x, pos.y);
+
+
+  }
+
+  // If aldehyde / acid had =O drawn as attachment, ensure its O labels shown previously.
+  // We also want to show the canonical IUPAC name hidden (for debug) - we won't show it on canvas.
+}
+
+// UI + flow
+let current = null;
+let correct = 0, tried = 0;
+
+function newQuestion(autodraw=true){
+  current = generateMolecule();
+  // regenerate until name is non-empty (safety)
+  if(!current || !current.name) current = generateMolecule();
+  // redraw canvas
+  drawMoleculeOnCanvas(current);
+  document.getElementById('result').textContent = '';
+  document.getElementById('answer').value = '';
+  // auto-scroll if enabled
+  if(document.getElementById('scrollToggle').checked){
+    document.getElementById('molCanvas').scrollIntoView({behavior:'smooth', block:'center'});
+  }
+}
+
+function checkAnswer(){
+  const ans = document.getElementById('answer').value;
+  const userNorm = normalize(ans);
+  const canonical = normalize(current.name);
+
+  tried++;
+
+  let ok = false;
+  // accept only exact normalized match
+  if(userNorm && userNorm === canonical){
+    ok = true;
+  }
+
+  const resultEl = document.getElementById('result');
+  if(ok){
+    correct++;
+    resultEl.textContent = '✅ Correct!';
+    resultEl.style.color = '#0a8a2e';
+  } else {
+    resultEl.textContent = `❌ Wrong — correct: ${current.name}`;
+    resultEl.style.color = '#b72c2c';
+  }
+
+  document.getElementById('scoreboard').textContent = `Correct: ${correct} • Tried: ${tried}`;
+  submitScore().then(() => fetchLeaderboard());
+  setTimeout(newQuestion, 1600);
+}
+
+window.addEventListener('load', fetchLeaderboard);
+
+
+
+// keyboard submit
+const answerInput = document.getElementById('answer');
+answerInput.addEventListener('keydown', (e) => {
+  if(e.key === 'Enter'){ e.preventDefault(); checkAnswer(); }
+});
+
+// button handlers
+document.getElementById('submitBtn').addEventListener('click', checkAnswer);
+document.getElementById('nextBtn').addEventListener('click', () => newQuestion());
+
+// dark mode toggle
+document.getElementById('darkToggle').addEventListener('change', (e) => {
+  if(e.target.checked) document.body.classList.add('darkbody');
+  else document.body.classList.remove('darkbody');
+});
+
+// auto-scroll toggle handled automatically in newQuestion
+
+// init
+newQuestion();
+
+// make canvas resize friendly
+window.addEventListener('resize', () => {
+  if(current) drawMoleculeOnCanvas(current);
+});
+</script>
+</body>
+</html>
